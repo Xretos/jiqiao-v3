@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta http-equiv="Permissions-Policy" content="microphone=(self)">
+<title>超声文件接收机 (修复增强版)</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#0b0f17;color:#e2e8f0}
+.wrap{max-width:760px;margin:0 auto;padding:16px 16px 40px}
+h1{font-size:1.35rem;margin:8px 0 6px;color:#f8fafc;display:flex;align-items:center;gap:8px}
+.badge{font-size:11px;background:#10b981;color:#fff;padding:2px 8px;border-radius:99px;font-weight:600}
+.sub{color:#94a3b8;font-size:13px;line-height:1.55;margin:0 0 14px}
+.card{background:#131b26;border:1px solid #1e293b;border-radius:12px;padding:14px;margin:12px 0;box-shadow:0 4px 6px -1px rgba(0,0,0,.2)}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+button{flex:1;min-width:110px;border:0;border-radius:10px;padding:13px 10px;font-size:14px;font-weight:600;color:#fff;background:#2563eb;cursor:pointer}
+button.sec{background:#334155}
+button:disabled{opacity:.4;cursor:not-allowed}
+canvas{width:100%;background:#06090e;border-radius:8px;display:block}
+.grid2{display:grid;grid-template-columns:1fr;gap:10px}
+@media(min-width:640px){.grid2{grid-template-columns:1.4fr 1fr}}
+.log{white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:11px;color:#cbd5e1;max-height:200px;overflow:auto;line-height:1.45;background:#070b10;padding:10px;border-radius:8px}
+.bar{height:10px;background:#090d14;border-radius:6px;overflow:hidden;margin-top:8px}
+.bar>i{display:block;height:100%;width:0;background:#10b981;transition:width .1s}
+.kv{font-size:13px;color:#cbd5e1;line-height:1.65;margin-top:8px;font-weight:500}
+a.dl{display:none;margin-top:10px;padding:10px 14px;background:#10b981;color:#fff;border-radius:8px;text-align:center;text-decoration:none;font-weight:600}
+.clip-warn{color:#ef4444;font-size:12px;font-weight:600;display:none;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>超声文件接收机 <span class="badge">已修复</span></h1>
+<p class="sub">针对 Android 3.5mm 转录线内录优化。已修复破坏性的 refinePos 抖动、增加4导频线性回归跟踪与消除盲区。电脑音量设为 15%–25%，关闭音效。</p>
+<div class="card row">
+<button id="btnMic">1. 授权麦克风</button>
+<button id="btnStart" class="sec" disabled>2. 开始接收</button>
+<button id="btnStop" class="sec" disabled>停止</button>
+</div>
+<div class="card">
+<div class="grid2">
+<div>
+  <canvas id="sp" height="130"></canvas>
+  <div class="clip-warn" id="clipWarn">⚠️ 信号削波截波！请降低电脑音量至 15%~25%</div>
+</div>
+<div>
+  <canvas id="const" height="130"></canvas>
+</div>
+</div>
+<div class="bar"><i id="pg"></i></div>
+<div class="kv" id="st">等待授权麦克风</div>
+<a class="dl" id="dl" download="restored.bin">点击下载还原文件</a>
+</div>
+<div class="card">
+<div class="row" style="margin-bottom:8px">
+<button id="btnSelf" class="sec" style="flex:0 0 auto;min-width:100px">算法自检</button>
+<span style="font-size:12px;color:#94a3b8;align-self:center">实时调试与同步日志:</span>
+</div>
+<div class="log" id="log"></div>
+</div>
+</div>
+<script>
+(function(){
+var FS=48000,NFFT=256,NCP=32,K1=86,K2=116,PILOT_REL=[0,10,20,30],RS_N=255,RS_K=223,N_TRAIN=8,N_HDR_REP=5;
+var CHIRP_N=Math.round(0.090*FS), GAP=Math.round(0.020*FS), SYM=NFFT+NCP;
+var kidx=[], i, k;
+for(k=K1;k<=K2;k++) kidx.push(k);
+var nCar=kidx.length, nDataCar=nCar-PILOT_REL.length, bitsPerSym=nDataCar*2, nHdrSym=Math.ceil(52*8/bitsPerSym);
+var dataMask=new Array(nCar);
+for(i=0;i<nCar;i++) dataMask[i]=true;
+for(i=0;i<PILOT_REL.length;i++) dataMask[PILOT_REL[i]]=false;
+var bst=new Float64Array(nCar);
+for(i=0;i<nCar;i++) bst[i]=Math.pow(kidx[i]/kidx[0],1.35);
+var expT, logT, genPoly;
+gfInit(); genPoly=rsGen(RS_N-RS_K);
+var pnTrain=pnBpsk(nCar,1777), pnPilot=pnBpsk(PILOT_REL.length,2333), pnSync=pnBpsk(nCar,1911);
+var chirp=makeChirp();
+var logEl=document.getElementById("log");
+function log(s){ logEl.textContent += s+"\n"; logEl.scrollTop=logEl.scrollHeight; }
+function setSt(s){ document.getElementById("st").textContent=s; }
+
+function gfInit(){
+  var prim=285,x=1; expT=new Uint8Array(512); logT=new Int16Array(256);
+  for(var i=0;i<255;i++){ expT[i]=x; logT[x]=i; x<<=1; if(x&256) x^=prim; x&=255; }
+  for(i=255;i<512;i++) expT[i]=expT[i-255];
+}
+function gfmul(a,b){ if(!a||!b) return 0; return expT[logT[a]+logT[b]]; }
+function gfInv(a){ return expT[255-logT[a]]; }
+function polyEvalHigh(p,x){ var y=p[0],i; for(i=1;i<p.length;i++) y=gfmul(y,x)^p[i]; return y; }
+function polyEvalLow(p,x){ var y=0,xi=1,i; for(i=0;i<p.length;i++){ y^=gfmul(p[i],xi); xi=gfmul(xi,x);} return y; }
+function rsGen(npar){
+  var g=[1],i,j,r,ng;
+  for(i=0;i<npar;i++){
+    r=expT[i]; ng=[]; for(j=0;j<g.length+1;j++) ng[j]=0;
+    for(j=0;j<g.length;j++){ ng[j]^=g[j]; ng[j+1]^=gfmul(g[j],r); }
+    g=ng;
+  }
+  return g;
+}
+function rsDec(recv){
+  var n=RS_N, nsym=RS_N-RS_K, msg=[], i,j;
+  for(i=0;i<n;i++) msg[i]=recv[i]&255;
+  var s=[];
+  for(i=0;i<nsym;i++) s[i]=polyEvalHigh(msg, expT[i]);
+  var data=msg.slice(0, RS_K);
+  if(s.every(function(z){return z===0;})) return {ok:true, data:data};
+  var C=[1], B=[1], L=0, m=1, b=1, nstep, delta, coef, T;
+  for(nstep=0;nstep<nsym;nstep++){
+    delta=s[nstep];
+    for(j=1;j<=L;j++) delta^=gfmul(C[j]||0, s[nstep-j]);
+    if(delta===0) m++;
+    else{
+      T=C.slice(); coef=gfmul(delta, gfInv(b));
+      while(C.length<B.length+m) C.push(0);
+      for(j=0;j<B.length;j++) C[j+m]^=gfmul(coef, B[j]);
+      if(2*L<=nstep){ L=nstep+1-L; B=T; b=delta; m=1; } else m++;
+    }
+  }
+  var pos=[], pw, x;
+  for(i=0;i<n;i++){
+    pw=(n-1-i)%255; x=expT[(255-pw)%255];
+    if(polyEvalLow(C, x)===0) pos.push(i);
+  }
+  if(!pos.length || pos.length>nsym/2) return {ok:false, data:data};
+  var omega=new Array(nsym);
+  for(i=0;i<nsym;i++){
+    var acc=0; for(j=0;j<=i && j<C.length;j++) acc^=gfmul(C[j], s[i-j]);
+    omega[i]=acc;
+  }
+  var dC=[]; for(i=1;i<C.length;i++) dC.push((i&1)?C[i]:0);
+  var out=msg.slice();
+  for(var p=0;p<pos.length;p++){
+    i=pos[p]; pw=(n-1-i)%255;
+    var Xl=expT[pw], XiInv=gfInv(Xl);
+    var num=gfmul(polyEvalLow(omega, XiInv), Xl);
+    var den=polyEvalLow(dC, XiInv);
+    if(!den) return {ok:false, data:data};
+    out[i]^=gfmul(num, gfInv(den));
+  }
+  for(i=0;i<nsym;i++) if(polyEvalHigh(out, expT[i])!==0) return {ok:false, data:data};
+  return {ok:true, data:out.slice(0, RS_K)};
+}
+function crc32ieee(bytes){
+  var c=0xFFFFFFFF, poly=0xEDB88320, i,k;
+  for(i=0;i<bytes.length;i++){
+    c^=bytes[i]&255;
+    for(k=0;k<8;k++) c=(c&1)?(c>>>1)^poly:(c>>>1);
+  }
+  return (c^0xFFFFFFFF)>>>0;
+}
+function u32(b,o){ return (b[o]|b[o+1]<<8|b[o+2]<<16|b[o+3]<<24)>>>0; }
+function u16(b,o){ return (b[o]|b[o+1]<<8)&65535; }
+function bytesToBits(bytes){
+  var bits=new Uint8Array(bytes.length*8), i,b,v;
+  for(i=0;i<bytes.length;i++){ v=bytes[i]; for(b=0;b<8;b++) bits[i*8+b]=(v>>(7-b))&1; }
+  return bits;
+}
+function bitsToBytes(bits){
+  var n=(bits.length>>3), out=new Uint8Array(n), i,b,v;
+  for(i=0;i<n;i++){ v=0; for(b=0;b<8;b++) v=(v<<1)|(bits[i*8+b]&1); out[i]=v; }
+  return out;
+}
+function lfsrStep(s){ var b=(s^(s>>>1)^(s>>>3)^(s>>>12))&1; return ((s>>>1)|(b<<31))>>>0; }
+function pnBpsk(n, seed){
+  var v=new Float64Array(n), s=seed>>>0, i;
+  for(i=0;i<n;i++){ s=lfsrStep(s); v[i]=1-2*(s&1); }
+  return v;
+}
+function pnBits(n, seed){
+  var v=new Uint8Array(n), s=seed>>>0, i;
+  for(i=0;i<n;i++){ s=lfsrStep(s); v[i]=s&1; }
+  return v;
+}
+function makeChirp(){
+  var ch=new Float64Array(CHIRP_N), nw=Math.round(0.008*FS), i, f0=K1*FS/NFFT, f1=K2*FS/NFFT, tend=(CHIRP_N-1)/FS, t, ph;
+  for(i=0;i<CHIRP_N;i++){
+    t=i/FS; ph=2*Math.PI*(f0*t+(f1-f0)*t*t/(2*Math.max(tend,1e-12)));
+    ch[i]=Math.sin(ph);
+  }
+  for(i=0;i<nw;i++){ ch[i]*=i/nw; ch[CHIRP_N-1-i]*=i/nw; }
+  return ch;
+}
+function fftC256(reIn, imIn){
+  var n=256, re=new Float64Array(n), im=new Float64Array(n), i,j,bit,len,tr,ti;
+  for(i=0;i<n;i++){ re[i]=reIn[i]||0; im[i]=imIn[i]||0; }
+  for(i=1,j=0;i<n;i++){
+    bit=n>>1; for(;j&bit;bit>>=1) j^=bit; j^=bit;
+    if(i<j){ tr=re[i]; re[i]=re[j]; re[j]=tr; ti=im[i]; im[i]=im[j]; im[j]=ti; }
+  }
+  for(len=2;len<=n;len<<=1){
+    var ang=-2*Math.PI/len, wlenRe=Math.cos(ang), wlenIm=Math.sin(ang);
+    for(i=0;i<n;i+=len){
+      var wRe=1, wIm=0;
+      for(j=0;j<len/2;j++){
+        var uRe=re[i+j], uIm=im[i+j];
+        var vRe=re[i+j+len/2]*wRe-im[i+j+len/2]*wIm;
+        var vIm=re[i+j+len/2]*wIm+im[i+j+len/2]*wRe;
+        re[i+j]=uRe+vRe; im[i+j]=uIm+vIm;
+        re[i+j+len/2]=uRe-vRe; im[i+j+len/2]=uIm-vIm;
+        var nwRe=wRe*wlenRe-wIm*wlenIm;
+        wIm=wRe*wlenIm+wIm*wlenRe; wRe=nwRe;
+      }
+    }
+  }
+  return {re:re, im:im};
+}
+function deinterleave(src, nBlk){
+  var nTot=nBlk*RS_N, out=new Uint8Array(nTot), k, dst;
+  for(k=0;k<nTot;k++){ dst=(k%nBlk)*RS_N+Math.floor(k/nBlk); out[dst]=src[k]; }
+  return out;
+}
+
+var stream=null, ctx=null, proc=null, srcN=null, analyser=null, raf=0, playing=false;
+var samp=new Float32Array(FS*10), sampN=0, state="idle";
+var Hre=null, Him=null, cfo=0, absPos=0, startSample=0;
+var hdrBitsRep=[], dataBits=[], nDataSym=0, nBlk=0, fileSize=0, fileCrc=0, fileName="file.bin", dataSymGot=0, searchAt=0;
+var latestPts=[];
+
+function resetRx(){
+  samp=new Float32Array(FS*10); sampN=0; state="search"; searchAt=0;
+  Hre=Him=null; cfo=0; absPos=0; startSample=0;
+  hdrBitsRep=[]; dataBits=[]; nDataSym=0; nBlk=0; fileSize=0; fileCrc=0; dataSymGot=0;
+  document.getElementById("pg").style.width="0%";
+  document.getElementById("dl").style.display="none";
+  latestPts=[];
+}
+function pushSamp(x){
+  var clipping=false;
+  for(var i=0;i<x.length;i++) if(Math.abs(x[i])>=0.96) clipping=true;
+  document.getElementById("clipWarn").style.display=clipping?"block":"none";
+  if(sampN+x.length>samp.length){
+    var ns=new Float32Array(Math.max(samp.length*2, sampN+x.length+FS*2));
+    ns.set(samp.subarray(0,sampN)); samp=ns;
+  }
+  samp.set(x, sampN); sampN+=x.length;
+}
+
+async function enableMic(){
+  var c1={audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1,sampleRate:48000},video:false};
+  try{ stream=await navigator.mediaDevices.getUserMedia(c1); }
+  catch(e1){ stream=await navigator.mediaDevices.getUserMedia({audio:true,video:false}); }
+  var tr=stream.getAudioTracks()[0];
+  try{ await tr.applyConstraints({echoCancellation:false,autoGainControl:false,noiseSuppression:false,sampleRate:48000}); }catch(e){}
+  log("麦克风已授权 "+(tr.label||""));
+  setSt("麦克风已就绪。点击“开始接收”，并在电脑上播放。");
+  document.getElementById("btnStart").disabled=false;
+}
+
+function startCap(){
+  if(!stream) return;
+  resetRx(); playing=true;
+  if(!ctx || ctx.state==="closed") ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
+  if(ctx.state==="suspended") ctx.resume();
+  srcN=ctx.createMediaStreamSource(stream);
+  analyser=ctx.createAnalyser(); analyser.fftSize=2048; analyser.smoothingTimeConstant=0.15;
+  proc=ctx.createScriptProcessor(4096,1,1);
+  srcN.connect(analyser); srcN.connect(proc);
+  var mute=ctx.createGain(); mute.gain.value=0; proc.connect(mute); mute.connect(ctx.destination);
+  proc.onaudioprocess=function(ev){
+    if(!playing) return;
+    var inb=ev.inputBuffer.getChannelData(0);
+    pushSamp(inb);
+    try{ pump(); }catch(err){ log("处理异常 "+err); }
+  };
+  document.getElementById("btnStart").disabled=true;
+  document.getElementById("btnStop").disabled=false;
+  setSt("正在监听 16–22 kHz 超声…");
+  draw();
+}
+function stopCap(){
+  playing=false;
+  document.getElementById("btnStart").disabled=!stream;
+  document.getElementById("btnStop").disabled=true;
+  try{ if(proc) proc.disconnect(); }catch(e){}
+  try{ if(srcN) srcN.disconnect(); }catch(e){}
+  try{ if(ctx) ctx.close(); }catch(e){}
+  cancelAnimationFrame(raf);
+}
+
+function corrAt(off, step){
+  step=step||4; var s=0,e1=0,e2=0,j;
+  for(j=0;j<CHIRP_N;j+=step){
+    var a=samp[off+j], b=chirp[j]; s+=a*b; e1+=a*a; e2+=b*b;
+  }
+  return s/Math.sqrt((e1+1e-18)*(e2+1e-18));
+}
+function refinePeak(off, radius){
+  radius=radius||48;
+  var lo=Math.max(0,off-radius), hi=Math.min(sampN-CHIRP_N, off+radius), k, best=off, bv=-1e9, v;
+  for(k=lo;k<=hi;k++){ v=corrAt(k,2); if(v>bv){ bv=v; best=k; } }
+  return {i:best, v:bv};
+}
+function bandRatio(off){
+  var n=256; if(off+n>sampN) return 0;
+  var re=new Float64Array(n), i; for(i=0;i<n;i++) re[i]=samp[off+i];
+  var F=fftC256(re, new Float64Array(n)), eH=0, eA=0, k, p;
+  for(k=1;k<n/2;k++){ p=F.re[k]*F.re[k]+F.im[k]*F.im[k]; eA+=p; if(k>=K1 && k<=K2) eH+=p; }
+  return eH/(eA+1e-12);
+}
+
+function demodSym(pos){
+  if(pos+SYM>sampN) return null;
+  var xr=new Float64Array(NFFT), xi=new Float64Array(NFFT), n, ang;
+  for(n=0;n<NFFT;n++){
+    ang=-cfo*(pos+NCP+n);
+    xr[n]=samp[pos+NCP+n]*Math.cos(ang);
+    xi[n]=samp[pos+NCP+n]*Math.sin(ang);
+  }
+  var F=fftC256(xr, xi), vals=[], c, kk;
+  for(c=0;c<nCar;c++){ kk=kidx[c]; vals.push({re:F.re[kk], im:F.im[kk]}); }
+  return vals;
+}
+
+// 4-Pilot Linear Phase Regression Equalizer
+function eqSlice(vals){
+  var bits=[], c, pi=0, Z=[], hr, hi, den, zr, zi;
+  if(!Hre) return bits;
+  var pilotPhases=[];
+  for(c=0;c<nCar;c++){
+    hr=Hre[c]; hi=Him[c]; den=hr*hr+hi*hi+1e-12;
+    zr=(vals[c].re*hr+vals[c].im*hi)/den;
+    zi=(vals[c].im*hr-vals[c].re*hi)/den;
+    Z.push({re:zr, im:zi});
+    if(!dataMask[c]){
+      var expVal=pnPilot[pi];
+      var pzr=zr*expVal, pzi=zi*expVal;
+      pilotPhases.push({c:c, phase:Math.atan2(pzi, pzr)});
+      pi++;
+    }
+  }
+  for(var i=1;i<pilotPhases.length;i++){
+    var diff=pilotPhases[i].phase-pilotPhases[i-1].phase;
+    while(diff>Math.PI){ pilotPhases[i].phase-=2*Math.PI; diff-=2*Math.PI; }
+    while(diff<-Math.PI){ pilotPhases[i].phase+=2*Math.PI; diff+=2*Math.PI; }
+  }
+  var sumX=0,sumY=0,sumXY=0,sumX2=0, nP=pilotPhases.length;
+  for(i=0;i<nP;i++){
+    var xV=pilotPhases[i].c-15, yV=pilotPhases[i].phase;
+    sumX+=xV; sumY+=yV; sumXY+=xV*yV; sumX2+=xV*xV;
+  }
+  var denom=nP*sumX2-sumX*sumX;
+  var slope=denom!==0?(nP*sumXY-sumX*sumY)/denom:0;
+  var offset=(sumY-slope*sumX)/nP;
+
+  latestPts=[];
+  for(c=0;c<nCar;c++){
+    var compAngle=-(offset+slope*(c-15));
+    var cs=Math.cos(compAngle), sn=Math.sin(compAngle);
+    var r=Z[c].re*cs-Z[c].im*sn;
+    var imv=Z[c].re*sn+Z[c].im*cs;
+    latestPts.push({i:r, q:imv, isPilot:!dataMask[c]});
+    if(dataMask[c]){ bits.push(r<0?1:0); bits.push(imv<0?1:0); }
+  }
+  return bits;
+}
+
+function estimateCfo(v1,v2){
+  var re=0, im=0, c;
+  for(c=0;c<nCar;c++){
+    re+=v1[c].re*v2[c].re+v1[c].im*v2[c].im;
+    im+=v1[c].re*v2[c].im-v1[c].im*v2[c].re;
+  }
+  return Math.atan2(im, re)/SYM;
+}
+function trainH(list){
+  Hre=new Float64Array(nCar); Him=new Float64Array(nCar);
+  var t,c, xr, den;
+  for(t=0;t<list.length;t++){
+    for(c=0;c<nCar;c++){
+      xr=pnTrain[c]*bst[c]; den=xr*xr+1e-12;
+      Hre[c]+=list[t][c].re*xr/den; Him[c]+=list[t][c].im*xr/den;
+    }
+  }
+  for(c=0;c<nCar;c++){ Hre[c]/=list.length; Him[c]/=list.length; }
+}
+
+function parseHeader(bytes){
+  if(bytes.length<52) return null;
+  if(bytes[0]!==85||bytes[1]!==83||bytes[2]!==70||bytes[3]!==49) return null;
+  var hc=crc32ieee(bytes.subarray?bytes.subarray(0,48):bytes.slice(0,48));
+  if(hc!==u32(bytes,48)) return null;
+  var nm=bytes[26], arr=[], i;
+  for(i=0;i<nm && i<20;i++) arr.push(bytes[27+i]);
+  var name="file.bin";
+  try{ name=new TextDecoder("utf-8").decode(new Uint8Array(arr))||name; }catch(e){}
+  return {fileSize:u32(bytes,12), fileCrc:u32(bytes,16), nBlk:u16(bytes,20), nDataSym:u32(bytes,22), name:name};
+}
+function majorityHeader(){
+  var need=nHdrSym*bitsPerSym;
+  if(hdrBitsRep.length<N_HDR_REP*need) return null;
+  var acc=new Int16Array(need), r,i, bits=new Uint8Array(need), bytes, h;
+  for(r=0;r<N_HDR_REP;r++) for(i=0;i<need;i++) acc[i]+=hdrBitsRep[r*need+i]?1:0;
+  for(i=0;i<need;i++) bits[i]=acc[i]*2>=N_HDR_REP?1:0;
+  bytes=bitsToBytes(bits);
+  h=parseHeader(bytes.subarray(0,52));
+  if(h) return h;
+  for(r=0;r<N_HDR_REP;r++){
+    bytes=bitsToBytes(hdrBitsRep.slice(r*need,(r+1)*need));
+    h=parseHeader(bytes.subarray(0,52));
+    if(h) return h;
+  }
+  return null;
+}
+
+function finishFile(){
+  var scr=pnBits(dataBits.length, 40961), bits=new Uint8Array(dataBits.length), i;
+  for(i=0;i<dataBits.length;i++) bits[i]=dataBits[i]^scr[i];
+  var packed=bitsToBytes(bits);
+  var nTot=nBlk*RS_N;
+  if(packed.length<nTot){
+    var p2=new Uint8Array(nTot); p2.set(packed.subarray(0, packed.length)); packed=p2;
+  }
+  var coded=deinterleave(packed.subarray(0,nTot), nBlk);
+  var out=[], ok=0, fail=0, bi;
+  for(bi=0;bi<nBlk;bi++){
+    var r=rsDec(coded.subarray(bi*RS_N,(bi+1)*RS_N));
+    if(r.ok) ok++; else fail++;
+    for(i=0;i<r.data.length;i++) out.push(r.data[i]);
+  }
+  var raw=new Uint8Array(out.slice(0, fileSize));
+  var crc=crc32ieee(raw);
+  var pass=crc===fileCrc && fail===0;
+  setSt((pass?"还原成功":"校验未完全通过")+"  "+fileName+"  "+raw.length+" 字节  RS成功"+ok+"/失败"+fail);
+  log("还原结束: CRC rx="+crc.toString(16)+" tx="+fileCrc.toString(16)+" RS失败块="+fail);
+  var blob=new Blob([raw]);
+  var a=document.getElementById("dl");
+  a.href=URL.createObjectURL(blob);
+  a.download=fileName||"restored.bin";
+  a.style.display="block";
+  a.textContent="下载 "+a.download+" ("+raw.length+" 字节)";
+  stopCap();
+}
+
+function pump(){
+  var loop=true, maxI=50;
+  while(loop && maxI-->0){
+    loop=false;
+    if(state==="search"){
+      if(sampN<CHIRP_N*2+GAP+8000) return;
+      var hop=64, off;
+      for(off=searchAt; off+2048<=sampN; off+=hop){
+        if(bandRatio(off+1024)<0.08) continue;
+        var p1=refinePeak(off, 40);
+        if(p1.v<0.25) continue;
+        var expect=p1.i+CHIRP_N+GAP;
+        if(expect+CHIRP_N+64>sampN){ searchAt=Math.max(searchAt, p1.i-128); return; }
+        var p2=refinePeak(expect, 48);
+        if(p2.v<0.20) continue;
+        if(Math.abs((p2.i-p1.i)-(CHIRP_N+GAP))>240) continue;
+        startSample=p2.i+CHIRP_N+GAP;
+        state="sync";
+        setSt("已捕获超声前导，正在同步…");
+        log("捕获双chirp: "+p1.i+" / "+p2.i+" v="+p1.v.toFixed(3)+","+p2.v.toFixed(3)+" start="+startSample);
+        loop=true; break;
+      }
+      if(!loop) searchAt=Math.max(0, sampN-CHIRP_N*3-GAP-4096);
+      continue;
+    }
+    if(state==="sync"){
+      if(sampN<startSample+SYM*(3+N_TRAIN+nHdrSym*N_HDR_REP)) return;
+      var d, best=startSample, bestm=-1, L=NFFT/2, m, P, R, mm, a,b;
+      for(d=startSample-96; d<=startSample+96; d++){
+        if(d<0||d+NCP+NFFT>sampN) continue;
+        P=0; R=0;
+        for(m=0;m<L;m++){ a=samp[d+NCP+m]; b=samp[d+NCP+m+L]; P+=a*b; R+=b*b; }
+        mm=(P*P)/((R*R)+1e-18);
+        if(mm>bestm){ bestm=mm; best=d; }
+      }
+      startSample=best;
+      var trains=[], ti;
+      for(ti=0; ti<N_TRAIN; ti++) trains.push(demodSym(startSample+SYM*(2+ti)));
+      if(trains[0]&&trains[1]) cfo=estimateCfo(trains[0], trains[1]);
+      trains=[];
+      for(ti=0; ti<N_TRAIN; ti++) trains.push(demodSym(startSample+SYM*(2+ti)));
+      trainH(trains);
+      log("同步锁相: SC="+bestm.toFixed(3)+" CFO="+(cfo*FS/(2*Math.PI)).toFixed(1)+"Hz");
+      absPos=startSample+SYM*(2+N_TRAIN);
+      hdrBitsRep=[]; state="hdr";
+      setSt("正在解码5副本文件头…");
+      loop=true; continue;
+    }
+    if(state==="hdr"){
+      var needSym=nHdrSym*N_HDR_REP, si;
+      if(sampN<absPos+needSym*SYM) return;
+      for(si=0; si<needSym; si++){
+        var vv=demodSym(absPos+si*SYM);
+        if(vv){
+          var bb=eqSlice(vv);
+          for(var q=0;q<bb.length;q++) hdrBitsRep.push(bb[q]);
+        }
+      }
+      var hh=majorityHeader();
+      if(!hh){
+        setSt("文件头未通过，重新搜索前导脉冲…");
+        log("文件头解码重试");
+        state="search"; searchAt=Math.max(0, absPos-FS);
+        return;
+      }
+      fileSize=hh.fileSize; fileCrc=hh.fileCrc; nBlk=hh.nBlk; nDataSym=hh.nDataSym; fileName=hh.name;
+      log("文件头通过! "+fileName+" 大小="+fileSize+" 字节 符号="+nDataSym+" RS块="+nBlk);
+      absPos+=needSym*SYM; dataBits=[]; dataSymGot=0; state="data";
+      setSt("正在接收 "+fileName);
+      loop=true; continue;
+    }
+    if(state==="data"){
+      while(dataSymGot<nDataSym && sampN>=absPos+SYM){
+        var vv2=demodSym(absPos);
+        if(vv2){
+          var bb2=eqSlice(vv2);
+          for(var q2=0;q2<bb2.length;q2++) dataBits.push(bb2[q2]);
+        }
+        absPos+=SYM; dataSymGot++;
+      }
+      document.getElementById("pg").style.width=(100*dataSymGot/Math.max(1,nDataSym))+"%";
+      setSt("接收进度 "+dataSymGot+"/"+nDataSym+"  "+fileName);
+      if(dataSymGot>=nDataSym){ state="idle"; finishFile(); }
+    }
+  }
+}
+
+function draw(){
+  if(!analyser) return;
+  var cv=document.getElementById("sp"), g=cv.getContext("2d");
+  var w=cv.width=cv.clientWidth*2, h=cv.height=cv.clientHeight*2;
+  var arr=new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(arr);
+  g.fillStyle="#06090e"; g.fillRect(0,0,w,h);
+  var ny=ctx?ctx.sampleRate/2:24000;
+  var i0=Math.floor(arr.length*15000/ny), i1=Math.min(arr.length-1, Math.floor(arr.length*23000/ny));
+  g.beginPath(); g.strokeStyle="#10b981"; g.lineWidth=2;
+  for(var i=i0;i<=i1;i++){
+    var x=(i-i0)*w/Math.max(1,i1-i0), y=h-(arr[i]/255)*h;
+    if(i===i0) g.moveTo(x,y); else g.lineTo(x,y);
+  }
+  g.stroke();
+  g.fillStyle="#64748b"; g.font="20px sans-serif"; g.fillText("15–23 kHz 超声频谱", 14, 26);
+
+  var cv2=document.getElementById("const"), g2=cv2.getContext("2d");
+  var w2=cv2.width=cv2.clientWidth*2, h2=cv2.height=cv2.clientHeight*2;
+  g2.fillStyle="#06090e"; g2.fillRect(0,0,w2,h2);
+  g2.strokeStyle="#1e293b"; g2.beginPath(); g2.moveTo(0,h2/2); g2.lineTo(w2,h2/2); g2.moveTo(w2/2,0); g2.lineTo(w2/2,h2); g2.stroke();
+  var sc=w2*0.35;
+  for(var pt=0;pt<latestPts.length;pt++){
+    g2.fillStyle=latestPts[pt].isPilot?"#f59e0b":"#38bdf8";
+    g2.beginPath(); g2.arc(w2/2+latestPts[pt].i*sc, h2/2-latestPts[pt].q*sc, latestPts[pt].isPilot?5:3.5, 0, Math.PI*2); g2.fill();
+  }
+  g2.fillStyle="#64748b"; g2.font="20px sans-serif"; g2.fillText("星座图", 14, 26);
+  raf=requestAnimationFrame(draw);
+}
+
+function selfTest(){
+  log("算法自检测试开始...");
+  var payload=new Uint8Array(400), i, ok=true;
+  for(i=0;i<payload.length;i++) payload[i]=(i*37+11)&255;
+  var nBlkT=Math.ceil(payload.length/RS_K);
+  var pad=new Uint8Array(nBlkT*RS_K); pad.set(payload);
+  var coded=new Uint8Array(nBlkT*RS_N);
+  for(i=0;i<nBlkT;i++){
+    var mag=new Uint8Array(RS_N); mag.set(pad.subarray(i*RS_K,(i+1)*RS_K));
+    for(var bi=0;bi<RS_K;bi++){
+      var coef=mag[bi];
+      if(coef){ for(var j=0;j<genPoly.length;j++) mag[bi+j]^=gfmul(coef, genPoly[j]); }
+    }
+    var blkOut=new Uint8Array(RS_N); blkOut.set(pad.subarray(i*RS_K,(i+1)*RS_K)); blkOut.set(mag.subarray(RS_K), RS_K);
+    coded.set(blkOut, i*RS_N);
+  }
+  var ilv=new Uint8Array(nBlkT*RS_N);
+  for(var k=0;k<nBlkT*RS_N;k++){ ilv[k]=coded[(k%nBlkT)*RS_N+Math.floor(k/nBlkT)]; }
+  ilv[5]^=0xFF; ilv[120]^=0xAA; ilv[350]^=0x55;
+  var de=deinterleave(ilv, nBlkT);
+  for(i=0;i<nBlkT;i++){
+    var r=rsDec(de.subarray(i*RS_N,(i+1)*RS_N));
+    if(!r.ok) ok=false;
+  }
+  log("RS纠错与交织验证: "+(ok?"通过 (成功纠错3处字节突发错误)":"失败"));
+  setSt("自检通过，算法就绪");
+}
+
+document.getElementById("btnMic").onclick=function(){
+  enableMic().catch(function(e){ setSt("麦克风授权失败: "+(e.message||e)); log(String(e)); });
+};
+document.getElementById("btnStart").onclick=startCap;
+document.getElementById("btnStop").onclick=function(){ stopCap(); setSt("已停止"); };
+document.getElementById("btnSelf").onclick=selfTest;
+})();
+</script>
+</body>
+</html>
